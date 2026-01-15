@@ -5,7 +5,6 @@ mail-prune.py — safety-first IMAP hygiene tool
 (single SQLite connection + dead-man staleness + dry-run safe queueing)
 
 Safety:
-- NEVER deletes, NEVER sets \Deleted, NEVER expunges.
 - Only uses UID COPY to a destination mailbox (PurgeQueue by default, or Trash if configured).
 
 Modes:
@@ -514,6 +513,10 @@ def uid_copy(imap: imaplib.IMAP4, uid: int, dest_mailbox: str) -> None:
     if typ != "OK":
         raise RuntimeError(f"UID COPY to {dest_mailbox} failed: {data}")
 
+def uid_mark_deleted(imap: imaplib.IMAP4, uid: int) -> None:
+    typ, data = imap.uid("STORE", str(uid), "+FLAGS.SILENT", r"(\Deleted)")
+    if typ != "OK":
+        raise RuntimeError(f"UID STORE +FLAGS \\Deleted failed: {data}")
 
 # -----------------------------
 # TTL decision helpers
@@ -581,15 +584,11 @@ def ttl_process_from_cache(conn: sqlite3.Connection, imap: imaplib.IMAP4,
                            uidvalidity: int,
                            rules: List[Rule],
                            dest_mailbox: str,
-                           scan_window_days: int,
                            dry_run: bool,
                            verbose: bool,
-                           max_per_rule: int) -> Tuple[int, int, int]:
+                           max_per_rule: int,
+                           delete_from_source: bool) -> Tuple[int, int, int]:
     now = utc_now()
-    min_days = min_rule_days(rules)
-
-    newer_than = now - timedelta(days=scan_window_days) if scan_window_days > 0 else None
-    older_than = now - timedelta(days=min_days) if min_days > 0 else None
 
     rows = conn.execute("""
         SELECT uid, internaldate, from_raw, subject, date_hdr, message_id, list_id, list_unsubscribe
@@ -603,13 +602,11 @@ def ttl_process_from_cache(conn: sqlite3.Connection, imap: imaplib.IMAP4,
     per_rule_counts: Dict[str, int] = {r.name: 0 for r in rules}
 
     for (uid, internal_s, frm, subj, date_hdr, message_id, list_id, list_unsub) in rows:
+        #if "codex" in (subj or "").lower() or "astral" in (frm or "").lower():
+        #    print("DEBUG ACT CANDIDATE:", frm, " // ", subj)
+
         internal_dt = parse_internaldate_to_dt(internal_s)
-
-        if newer_than and internal_dt and internal_dt < newer_than:
-            continue
-        if older_than and internal_dt and internal_dt >= older_than:
-            continue
-
+        
         candidates += 1
 
         # Find first matching rule by headers (independent of TTL)
@@ -645,7 +642,11 @@ def ttl_process_from_cache(conn: sqlite3.Connection, imap: imaplib.IMAP4,
             action_taken = "dry_run"
         else:
             uid_copy(imap, int(uid), dest_mailbox)
-            action_taken = "copied"
+            if delete_from_source:
+                uid_mark_deleted(imap, int(uid))
+                action_taken = "copied_deleted"
+            else:
+                action_taken = "copied"
             copied += 1
             if verbose:
                 print("OK:", line)
@@ -732,7 +733,11 @@ def ignore_age_sweep(conn: sqlite3.Connection, imap: imaplib.IMAP4,
                 action_taken = "dry_run"
             else:
                 uid_copy(imap, int(uid), dest_mailbox)
-                action_taken = "copied"
+                if delete_from_source:
+                    uid_mark_deleted(imap, int(uid))
+                    action_taken = "copied_deleted"
+                else:
+                    action_taken = "copied"
                 copied += 1
                 if verbose:
                     print("OK:", line)
@@ -823,6 +828,9 @@ def main() -> int:
         creds_path = acct.get("credentials_json")
         username = acct.get("username", "")
         creds_key = acct.get("credentials_key", username)
+        delete_from_source = acct.get("delete_from_source")
+        expunge_after_run = acct.get("expunge_after_run")
+        
         if not creds_path or not username or not creds_key:
             print("Config must include account.username, account.credentials_json, account.credentials_key.", file=sys.stderr)
             return 2
@@ -917,12 +925,19 @@ def main() -> int:
                         uidvalidity=uidvalidity,
                         rules=rules,
                         dest_mailbox=dest_mailbox,
-                        scan_window_days=scan_window_days,
                         dry_run=args.dry_run,
                         verbose=args.verbose,
                         max_per_rule=args.max_per_rule,
+                        delete_from_source=delete_from_source
                     )
-
+                    # ... after ttl_process_from_cache / ignore_age_sweep, before moving to next mailbox
+                    if (not args.dry_run) and delete_from_source and expunge_after_run:
+                        typ, data = imap.expunge()
+                        if typ != "OK":
+                            raise RuntimeError(f"EXPUNGE failed: {data}")
+                        if args.verbose:
+                            print(f"[{mailbox}] EXPUNGE complete")
+                    
                 conn.commit()
                 total_candidates += c
                 total_matched += m
@@ -983,7 +998,8 @@ def main() -> int:
                         subject=subject,
                         body=body,
                     )
-
+#            if not args.dry_run and delete_from_source and expunge_after_run:
+#                imap.expunge()
             print(summary + "\n" + stale_section)
             return 0
 
