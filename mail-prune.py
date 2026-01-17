@@ -436,14 +436,6 @@ def select_mailbox(imap: imaplib.IMAP4, mailbox: str) -> None:
     if typ != "OK":
         raise RuntimeError(f"Cannot select mailbox {mailbox}: {data}")
 
-
-def ensure_mailbox_exists(imap: imaplib.IMAP4, mailbox: str) -> None:
-    try:
-        imap.create(mailbox)
-    except Exception:
-        pass
-
-
 def status_uidvalidity_uidnext(imap: imaplib.IMAP4, mailbox: str) -> Tuple[int, int]:
     typ, data = imap.status(mailbox, "(UIDVALIDITY UIDNEXT)")
     if typ != "OK" or not data or not data[0]:
@@ -537,11 +529,6 @@ def eligible_by_days(internal_dt: Optional[datetime], now: datetime, days: int) 
     if not internal_dt:
         return False
     return internal_dt < (now - timedelta(days=days))
-
-
-def min_rule_days(rules: List[Rule]) -> int:
-    ds = [r.days for r in rules if r.days and r.days > 0]
-    return min(ds) if ds else 0
 
 
 # -----------------------------
@@ -686,7 +673,8 @@ def ignore_age_sweep(conn: sqlite3.Connection, imap: imaplib.IMAP4,
                      dest_mailbox: str,
                      dry_run: bool,
                      verbose: bool,
-                     max_per_rule: int) -> Tuple[int, int, int]:
+                     max_per_rule: int,
+                     delete_from_source: bool) -> Tuple[int, int, int]:
     uids = uid_search_all(imap)
     if verbose:
         print(f"[{mailbox}] sweep: {len(uids)} total messages (UID SEARCH ALL)")
@@ -784,7 +772,6 @@ def main() -> int:
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--max-per-rule", type=int, default=0)
     ap.add_argument("--ignore-age", action="store_true")
-    ap.add_argument("--scan-window-days", type=int, default=None)
     ap.add_argument("--mailbox", action="append", default=[])
     args = ap.parse_args()
 
@@ -858,10 +845,6 @@ def main() -> int:
             return 2
         dest_mailbox = target_mailbox if action == "copy_to_folder" else trash_mailbox
 
-        scan_window_days = args.scan_window_days
-        if scan_window_days is None:
-            scan_window_days = int(acct.get("scan_window_days", 180))
-
         mailboxes = args.mailbox[:] if args.mailbox else [mailbox_default]
 
         imap = connect_imap(host, port, starttls)
@@ -872,7 +855,6 @@ def main() -> int:
                 typ, caps = imap.capability()
                 print("IMAP capabilities:", caps)
 
-            #ensure_mailbox_exists(imap, dest_mailbox)
             # Verify destination mailbox exists and is selectable; do NOT create it.
             typ, _ = imap.select(dest_mailbox, readonly=True)
             if typ != "OK":
@@ -904,6 +886,7 @@ def main() -> int:
                         dry_run=args.dry_run,
                         verbose=args.verbose,
                         max_per_rule=args.max_per_rule,
+                        delete_from_source=delete_from_source
                     )
                 else:
                     ing = ingest_new_headers_ttl(
@@ -955,7 +938,6 @@ def main() -> int:
                 f"mailboxes={', '.join(mailboxes)}\n"
                 f"dest_mailbox={dest_mailbox}\n"
                 f"ignore_age={args.ignore_age}\n"
-                f"scan_window_days={scan_window_days if not args.ignore_age else 'N/A'}\n"
                 f"ingested_new_headers={total_ingested if not args.ignore_age else 'N/A'}\n"
                 f"candidates_considered={total_candidates}\n"
                 f"matched={total_matched}\n"
