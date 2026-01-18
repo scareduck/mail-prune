@@ -565,6 +565,50 @@ def ingest_new_headers_ttl(conn: sqlite3.Connection, imap: imaplib.IMAP4,
 
     return ingested
 
+def ingest_all_headers(conn: sqlite3.Connection, imap: imaplib.IMAP4,
+                       account: str, mailbox: str,
+                       uidvalidity: int, uidnext: int,
+                       verbose: bool) -> int:
+    """
+    Backfill: ingest headers for ALL messages currently present in the mailbox,
+    but only FETCH headers for UIDs not already present in msg_cache.
+
+    Safety: headers-only. No rule evaluation. No COPY/DELETE/EXPUNGE.
+    """
+    uids = uid_search_all(imap)
+    if not uids:
+        if verbose:
+            print(f"[{mailbox}] ingest-all: mailbox empty")
+        # Advance state so TTL ingest doesn't try to walk 1..UIDNEXT-1 forever on an empty box
+        db_set_state(conn, account, mailbox, uidvalidity, max(0, uidnext - 1))
+        return 0
+
+    rows = conn.execute("""
+        SELECT uid
+        FROM msg_cache
+        WHERE account=? AND mailbox=? AND uidvalidity=?
+    """, (account, mailbox, uidvalidity)).fetchall()
+    cached = {int(r[0]) for r in rows}
+
+    missing = [int(u) for u in uids if int(u) not in cached]
+    if verbose:
+        print(f"[{mailbox}] ingest-all: server_uids={len(uids)} cached={len(cached)} missing={len(missing)}")
+
+    ingested = 0
+    for part in chunks(missing, 200):
+        hdrs = uid_fetch_headers(imap, part)
+        for uid, h in hdrs.items():
+            db_upsert_cache(conn, account, mailbox, uidvalidity, int(uid), h)
+            ingested += 1
+
+    # Mark that we've "seen" up through UIDNEXT-1 so TTL ingest won't rescan historic ranges
+    db_set_state(conn, account, mailbox, uidvalidity, max(0, uidnext - 1))
+
+    if verbose:
+        print(f"[{mailbox}] ingest-all: ingested={ingested} headers")
+    return ingested
+
+
 
 def ttl_process_from_cache(conn: sqlite3.Connection, imap: imaplib.IMAP4,
                            account: str, mailbox: str,
@@ -776,6 +820,8 @@ def main() -> int:
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--max-per-rule", type=int, default=0)
     ap.add_argument("--ignore-age", action="store_true")
+    ap.add_argument("--ingest-all", action="store_true",
+                    help="Backfill headers for all UIDs into cache (missing-only), then continue normal processing.")
     ap.add_argument("--mailbox", action="append", default=[])
     args = ap.parse_args()
 
@@ -877,6 +923,19 @@ def main() -> int:
 
                 if args.verbose:
                     print(f"\n=== Mailbox: {mailbox} (UIDVALIDITY={uidvalidity}, UIDNEXT={uidnext}) ===")
+
+                # Optional full backfill before actioning (still headers-only here).
+                if args.ingest_all:
+                    ing = ingest_all_headers(
+                        conn=conn,
+                        imap=imap,
+                        account=username,
+                        mailbox=mailbox,
+                        uidvalidity=uidvalidity,
+                        uidnext=uidnext,
+                        verbose=args.verbose,
+                    )
+                    total_ingested += ing
 
                 if args.ignore_age:
                     c, m, cp = ignore_age_sweep(
