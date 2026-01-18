@@ -767,7 +767,11 @@ def ignore_age_sweep(conn: sqlite3.Connection, imap: imaplib.IMAP4,
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", required=True)
+    ap.add_argument("--config",
+                    default=os.environ.get("MAIL_PRUNE_CONFIG",
+                                           "~/.config/mail-prune/config.yaml"),
+                    help="Path to YAML config (default $MAIL_PRUNE_CONFIG or ~/.config/mail-prune/config.yaml"
+                    )
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--max-per-rule", type=int, default=0)
@@ -815,8 +819,8 @@ def main() -> int:
         creds_path = acct.get("credentials_json")
         username = acct.get("username", "")
         creds_key = acct.get("credentials_key", username)
-        delete_from_source = acct.get("delete_from_source")
-        expunge_after_run = acct.get("expunge_after_run")
+        delete_from_source = bool(acct.get("delete_from_source",False))
+        expunge_after_run = bool(acct.get("expunge_after_run",False))
         
         if not creds_path or not username or not creds_key:
             print("Config must include account.username, account.credentials_json, account.credentials_key.", file=sys.stderr)
