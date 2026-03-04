@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.header import decode_header, make_header
 from email.message import EmailMessage
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import smtplib
 
@@ -393,6 +393,58 @@ def compile_rules(raw_rules: list) -> List[Rule]:
             subject_rx=re.compile(r["subject_regex"], re.IGNORECASE) if r.get("subject_regex") else None,
             match_mode=mode,
         ))
+    return out
+
+
+def normalize_accounts(cfg: dict) -> List[dict]:
+    """Return account configs supporting legacy single-account and new multi-account forms."""
+    raw_accounts = cfg.get("accounts")
+    if raw_accounts is None:
+        legacy = cfg.get("account", {}) or {}
+        return [legacy] if legacy else []
+
+    out: List[dict] = []
+    if isinstance(raw_accounts, list):
+        for item in raw_accounts:
+            if isinstance(item, dict):
+                out.append(item)
+        return out
+
+    if isinstance(raw_accounts, dict):
+        for key, item in raw_accounts.items():
+            if not isinstance(item, dict):
+                continue
+            merged = dict(item)
+            merged.setdefault("username", key)
+            merged.setdefault("credentials_key", key)
+            out.append(merged)
+    return out
+
+
+def resolve_rules_for_account(raw_rules_cfg: Any, account_key: str) -> List[dict]:
+    """
+    Supported shapes:
+      - rules: [ ... ]  (legacy/global-only)
+      - rules:
+          global: [ ... ]
+          per_address:
+            <email>: [ ... ]
+    """
+    if isinstance(raw_rules_cfg, list):
+        return raw_rules_cfg
+
+    if not isinstance(raw_rules_cfg, dict):
+        return []
+
+    global_rules = raw_rules_cfg.get("global", []) or []
+    per_address = raw_rules_cfg.get("per_address", {}) or {}
+    address_rules = per_address.get(account_key, []) if isinstance(per_address, dict) else []
+
+    out: List[dict] = []
+    if isinstance(global_rules, list):
+        out.extend(r for r in global_rules if isinstance(r, dict))
+    if isinstance(address_rules, list):
+        out.extend(r for r in address_rules if isinstance(r, dict))
     return out
 
 
@@ -827,29 +879,21 @@ def main() -> int:
 
     cfg = load_yaml_config(expand_path(args.config))
 
-    acct = cfg.get("account", {}) or {}
     smtp_cfg = cfg.get("smtp", {}) or {}
     db_cfg = cfg.get("database", {}) or {}
     notify = cfg.get("notify", {}) or {}
-    raw_rules = cfg.get("rules", []) or []
+    raw_rules_cfg = cfg.get("rules", []) or []
+    accounts = normalize_accounts(cfg)
+
+    if not accounts:
+        print("Config must include account (legacy) or accounts (list/map).", file=sys.stderr)
+        return 2
 
     # Expand config paths
-    if isinstance(acct.get("credentials_json"), str):
-        acct["credentials_json"] = expand_path(acct["credentials_json"])
     if isinstance(smtp_cfg.get("credentials_json"), str):
         smtp_cfg["credentials_json"] = expand_path(smtp_cfg["credentials_json"])
     if isinstance(db_cfg.get("path"), str):
         db_cfg["path"] = expand_path(db_cfg["path"])
-
-    try:
-        rules = compile_rules(raw_rules)
-    except ValueError as e:
-        print(str(e), file=sys.stderr)
-        return 2
-
-    if not rules:
-        print("No rules found in config.", file=sys.stderr)
-        return 2
 
     db_path = db_cfg.get("path")
     if not db_path:
@@ -861,198 +905,158 @@ def main() -> int:
 
     conn = sqlite3.connect(db_path, timeout=30)
     try:
-        # Credentials
-        creds_path = acct.get("credentials_json")
-        username = acct.get("username", "")
-        creds_key = acct.get("credentials_key", username)
-        delete_from_source = bool(acct.get("delete_from_source",False))
-        expunge_after_run = bool(acct.get("expunge_after_run",False))
-        
-        if not creds_path or not username or not creds_key:
-            print("Config must include account.username, account.credentials_json, account.credentials_key.", file=sys.stderr)
-            return 2
+        all_summaries: List[str] = []
+        had_warnings = False
 
-        creds = load_creds(creds_path)
-        imap_password = get_password(creds, creds_key, "password")
-        if not imap_password:
-            print(f"No IMAP password found in {creds_path} for key '{creds_key}'", file=sys.stderr)
-            return 2
+        for acct in accounts:
+            if isinstance(acct.get("credentials_json"), str):
+                acct["credentials_json"] = expand_path(acct["credentials_json"])
 
-        host = acct.get("host", "")
-        port = int(acct.get("port", 993))
-        starttls = bool(acct.get("starttls", False))
-        if not host:
-            print("account.host is required.", file=sys.stderr)
-            return 2
+            creds_path = acct.get("credentials_json")
+            username = acct.get("username", "")
+            creds_key = acct.get("credentials_key", username)
+            delete_from_source = bool(acct.get("delete_from_source", False))
+            expunge_after_run = bool(acct.get("expunge_after_run", False))
 
-        mailbox_default = acct.get("mailbox", "INBOX")
+            if not creds_path or not username or not creds_key:
+                print("Each account must include username, credentials_json, credentials_key.", file=sys.stderr)
+                return 2
 
-        action = acct.get("action", "copy_to_folder")
-        target_mailbox = acct.get("target_mailbox", "PurgeQueue")
-        trash_mailbox = acct.get("trash_mailbox", "Trash")
-        if action not in ("copy_to_folder", "copy_to_trash"):
-            print("For safety, account.action must be copy_to_folder or copy_to_trash.", file=sys.stderr)
-            return 2
-        dest_mailbox = target_mailbox if action == "copy_to_folder" else trash_mailbox
-
-        mailboxes = args.mailbox[:] if args.mailbox else [mailbox_default]
-
-        imap = connect_imap(host, port, starttls)
-        try:
-            login_imap(imap, username, imap_password)
-
-            if args.verbose:
-                typ, caps = imap.capability()
-                print("IMAP capabilities:", caps)
-
-            # Verify destination mailbox exists and is selectable; do NOT create it.
-            typ, _ = imap.select(dest_mailbox, readonly=True)
-            if typ != "OK":
-                raise SystemExit(
-                    f"FATAL: destination mailbox '{dest_mailbox}' does not exist or is not selectable. Aborting."
-                )
-
-            total_candidates = 0
-            total_matched = 0
-            total_copied = 0
-            total_ingested = 0
-
-            for mailbox in mailboxes:
-                select_mailbox(imap, mailbox)
-                uidvalidity, uidnext = status_uidvalidity_uidnext(imap, mailbox)
-
-                if args.verbose:
-                    print(f"\n=== Mailbox: {mailbox} (UIDVALIDITY={uidvalidity}, UIDNEXT={uidnext}) ===")
-
-                # Optional full backfill before actioning (still headers-only here).
-                if args.ingest_all:
-                    ing = ingest_all_headers(
-                        conn=conn,
-                        imap=imap,
-                        account=username,
-                        mailbox=mailbox,
-                        uidvalidity=uidvalidity,
-                        uidnext=uidnext,
-                        verbose=args.verbose,
-                    )
-                    total_ingested += ing
-
-                if args.ignore_age:
-                    c, m, cp = ignore_age_sweep(
-                        conn=conn,
-                        imap=imap,
-                        account=username,
-                        mailbox=mailbox,
-                        uidvalidity=uidvalidity,
-                        rules=rules,
-                        dest_mailbox=dest_mailbox,
-                        dry_run=args.dry_run,
-                        verbose=args.verbose,
-                        max_per_rule=args.max_per_rule,
-                        delete_from_source=delete_from_source
-                    )
-                else:
-                    ing = ingest_new_headers_ttl(
-                        conn=conn,
-                        imap=imap,
-                        account=username,
-                        mailbox=mailbox,
-                        uidvalidity=uidvalidity,
-                        uidnext=uidnext,
-                        verbose=args.verbose,
-                    )
-                    total_ingested += ing
-
-                    c, m, cp = ttl_process_from_cache(
-                        conn=conn,
-                        imap=imap,
-                        account=username,
-                        mailbox=mailbox,
-                        uidvalidity=uidvalidity,
-                        rules=rules,
-                        dest_mailbox=dest_mailbox,
-                        dry_run=args.dry_run,
-                        verbose=args.verbose,
-                        max_per_rule=args.max_per_rule,
-                        delete_from_source=delete_from_source
-                    )
-                    # ... after ttl_process_from_cache / ignore_age_sweep, before moving to next mailbox
-                    if (not args.dry_run) and delete_from_source and expunge_after_run:
-                        typ, data = imap.expunge()
-                        if typ != "OK":
-                            raise RuntimeError(f"EXPUNGE failed: {data}")
-                        if args.verbose:
-                            print(f"[{mailbox}] EXPUNGE complete")
-                    
-                conn.commit()
-                total_candidates += c
-                total_matched += m
-                total_copied += cp
-
-            # Dead-man staleness: DISABLE when --ignore-age
-            warnings: List[str] = []
-            if not args.ignore_age:
-                warnings = stale_rule_warnings_deadman(conn, raw_rules, utc_now(), username, mailboxes)
-
-            summary = (
-                f"mail-prune run: {utc_now().isoformat()}\n"
-                f"account={username}\n"
-                f"mode={'DRY-RUN' if args.dry_run else 'LIVE'}\n"
-                f"mailboxes={', '.join(mailboxes)}\n"
-                f"dest_mailbox={dest_mailbox}\n"
-                f"ignore_age={args.ignore_age}\n"
-                f"ingested_new_headers={total_ingested if not args.ignore_age else 'N/A'}\n"
-                f"candidates_considered={total_candidates}\n"
-                f"matched={total_matched}\n"
-                f"copied={total_copied}\n"
-            )
-            stale_section = "Stale-source check:\n" + ("\n".join(warnings) if warnings else "OK") + "\n"
-
-            # Notify (skip on dry-run)
-            if notify.get("enabled", False) and not args.dry_run:
-                only_on_warnings = bool(notify.get("only_on_warnings", True))
-                if warnings or not only_on_warnings:
-                    smtp_host = smtp_cfg.get("host")
-                    if not smtp_host:
-                        raise RuntimeError("notify.enabled is true but smtp.host is missing.")
-                    smtp_port = int(smtp_cfg.get("port", 587))
-                    smtp_starttls = bool(smtp_cfg.get("starttls", True))
-                    smtp_user = smtp_cfg.get("username", username)
-
-                    smtp_creds_path = smtp_cfg.get("credentials_json", creds_path)
-                    smtp_creds_key = smtp_cfg.get("credentials_key", smtp_user)
-                    smtp_pw_field = smtp_cfg.get("password_field", "smtp_password")
-
-                    smtp_creds = creds if expand_path(smtp_creds_path) == expand_path(creds_path) else load_creds(smtp_creds_path)
-                    smtp_password = get_password(smtp_creds, smtp_creds_key, smtp_pw_field)
-                    if not smtp_password:
-                        raise RuntimeError(f"No SMTP password found for key '{smtp_creds_key}' field '{smtp_pw_field}'")
-
-                    subject_prefix = notify.get("subject_prefix", "[mail-prune]")
-                    subject = f"{subject_prefix} {'WARN' if warnings else 'OK'}"
-                    body = summary + "\n" + stale_section
-
-                    send_smtp_email(
-                        host=smtp_host,
-                        port=smtp_port,
-                        starttls=smtp_starttls,
-                        username=smtp_user,
-                        password=smtp_password,
-                        to_addr=notify["to"],
-                        from_addr=notify["from"],
-                        subject=subject,
-                        body=body,
-                    )
-#            if not args.dry_run and delete_from_source and expunge_after_run:
-#                imap.expunge()
-            print(summary + "\n" + stale_section)
-            return 0
-
-        finally:
+            raw_rules = resolve_rules_for_account(raw_rules_cfg, username)
             try:
-                imap.logout()
-            except Exception:
-                pass
+                rules = compile_rules(raw_rules)
+            except ValueError as e:
+                print(f"[{username}] {e}", file=sys.stderr)
+                return 2
+            if not rules:
+                print(f"[{username}] No rules found (global/per_address).", file=sys.stderr)
+                return 2
+
+            creds = load_creds(creds_path)
+            imap_password = get_password(creds, creds_key, "password")
+            if not imap_password:
+                print(f"No IMAP password found in {creds_path} for key '{creds_key}'", file=sys.stderr)
+                return 2
+
+            host = acct.get("host", "")
+            port = int(acct.get("port", 993))
+            starttls = bool(acct.get("starttls", False))
+            if not host:
+                print(f"[{username}] account.host is required.", file=sys.stderr)
+                return 2
+
+            mailbox_default = acct.get("mailbox", "INBOX")
+            action = acct.get("action", "copy_to_folder")
+            target_mailbox = acct.get("target_mailbox", "PurgeQueue")
+            trash_mailbox = acct.get("trash_mailbox", "Trash")
+            if action not in ("copy_to_folder", "copy_to_trash"):
+                print(f"[{username}] account.action must be copy_to_folder or copy_to_trash.", file=sys.stderr)
+                return 2
+            dest_mailbox = target_mailbox if action == "copy_to_folder" else trash_mailbox
+            mailboxes = args.mailbox[:] if args.mailbox else [mailbox_default]
+
+            imap = connect_imap(host, port, starttls)
+            try:
+                login_imap(imap, username, imap_password)
+                if args.verbose:
+                    typ, caps = imap.capability()
+                    print(f"[{username}] IMAP capabilities:", caps)
+
+                typ, _ = imap.select(dest_mailbox, readonly=True)
+                if typ != "OK":
+                    raise SystemExit(
+                        f"FATAL [{username}]: destination mailbox '{dest_mailbox}' does not exist or is not selectable."
+                    )
+
+                total_candidates = 0
+                total_matched = 0
+                total_copied = 0
+                total_ingested = 0
+
+                for mailbox in mailboxes:
+                    select_mailbox(imap, mailbox)
+                    uidvalidity, uidnext = status_uidvalidity_uidnext(imap, mailbox)
+                    if args.verbose:
+                        print(f"\n=== Account: {username} Mailbox: {mailbox} (UIDVALIDITY={uidvalidity}, UIDNEXT={uidnext}) ===")
+
+                    if args.ingest_all:
+                        ing = ingest_all_headers(conn, imap, username, mailbox, uidvalidity, uidnext, args.verbose)
+                        total_ingested += ing
+
+                    if args.ignore_age:
+                        c, m, cp = ignore_age_sweep(conn, imap, username, mailbox, uidvalidity, rules,
+                                                    dest_mailbox, args.dry_run, args.verbose,
+                                                    args.max_per_rule, delete_from_source)
+                    else:
+                        ing = ingest_new_headers_ttl(conn, imap, username, mailbox, uidvalidity, uidnext, args.verbose)
+                        total_ingested += ing
+                        c, m, cp = ttl_process_from_cache(conn, imap, username, mailbox, uidvalidity, rules,
+                                                          dest_mailbox, args.dry_run, args.verbose,
+                                                          args.max_per_rule, delete_from_source)
+                        if (not args.dry_run) and delete_from_source and expunge_after_run:
+                            typ, data = imap.expunge()
+                            if typ != "OK":
+                                raise RuntimeError(f"EXPUNGE failed: {data}")
+                            if args.verbose:
+                                print(f"[{username}:{mailbox}] EXPUNGE complete")
+
+                    conn.commit()
+                    total_candidates += c
+                    total_matched += m
+                    total_copied += cp
+
+                warnings: List[str] = []
+                if not args.ignore_age:
+                    warnings = stale_rule_warnings_deadman(conn, raw_rules, utc_now(), username, mailboxes)
+                had_warnings = had_warnings or bool(warnings)
+
+                summary = (
+                    f"mail-prune run: {utc_now().isoformat()}\n"
+                    f"account={username}\n"
+                    f"mode={'DRY-RUN' if args.dry_run else 'LIVE'}\n"
+                    f"mailboxes={', '.join(mailboxes)}\n"
+                    f"dest_mailbox={dest_mailbox}\n"
+                    f"ignore_age={args.ignore_age}\n"
+                    f"ingested_new_headers={total_ingested if not args.ignore_age else 'N/A'}\n"
+                    f"candidates_considered={total_candidates}\n"
+                    f"matched={total_matched}\n"
+                    f"copied={total_copied}\n"
+                )
+                stale_section = "Stale-source check:\n" + ("\n".join(warnings) if warnings else "OK") + "\n"
+                all_summaries.append(summary + "\n" + stale_section)
+
+                if notify.get("enabled", False) and not args.dry_run:
+                    only_on_warnings = bool(notify.get("only_on_warnings", True))
+                    if warnings or not only_on_warnings:
+                        smtp_host = smtp_cfg.get("host")
+                        if not smtp_host:
+                            raise RuntimeError("notify.enabled is true but smtp.host is missing.")
+                        smtp_port = int(smtp_cfg.get("port", 587))
+                        smtp_starttls = bool(smtp_cfg.get("starttls", True))
+                        smtp_user = smtp_cfg.get("username", username)
+                        smtp_creds_path = smtp_cfg.get("credentials_json", creds_path)
+                        smtp_creds_key = smtp_cfg.get("credentials_key", smtp_user)
+                        smtp_pw_field = smtp_cfg.get("password_field", "smtp_password")
+                        smtp_creds = creds if expand_path(smtp_creds_path) == expand_path(creds_path) else load_creds(smtp_creds_path)
+                        smtp_password = get_password(smtp_creds, smtp_creds_key, smtp_pw_field)
+                        if not smtp_password:
+                            raise RuntimeError(f"No SMTP password found for key '{smtp_creds_key}' field '{smtp_pw_field}'")
+                        subject_prefix = notify.get("subject_prefix", "[mail-prune]")
+                        subject = f"{subject_prefix} {'WARN' if warnings else 'OK'}"
+                        send_smtp_email(smtp_host, smtp_port, smtp_starttls, smtp_user, smtp_password,
+                                        notify["to"], notify["from"], subject, summary + "\n" + stale_section)
+            finally:
+                try:
+                    imap.logout()
+                except Exception:
+                    pass
+
+        if len(accounts) > 1:
+            header = f"Processed {len(accounts)} accounts. warnings_present={had_warnings}\n\n"
+        else:
+            header = ""
+        print(header + "\n".join(all_summaries))
+        return 0
 
     finally:
         try:
