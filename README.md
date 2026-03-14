@@ -60,4 +60,18 @@ rules:
         from_regex: "alerts@"
 ```
 
-`rules.global` applies to every account. `rules.per_address.<email>` applies only to that email/account.
+`rules.global` applies to every account. `rules.per_address.<username-email>` applies only to that account.
+
+## Multi-account behavior notes
+
+- Best effort: one account failure does not abort other accounts.
+- If an account resolves to zero rules, it is skipped with a warning.
+- Notifications are consolidated into a single run-level message.
+- Cache rows are synced each run: `msg_cache` rows for UIDs no longer in the mailbox are pruned.
+
+## CLI account/mailbox selection behavior
+
+- `--address <email>` limits processing to a single configured account whose `username` matches that address.
+- `--mailbox <name>` can be repeated and overrides configured default mailbox selection.
+- If `--mailbox` is provided, `--ignore-age` defaults to enabled (archival-folder behavior).
+- Use `--noignore-age` to force TTL mode even when `--mailbox` is specified.
