@@ -1,6 +1,6 @@
 # mail-prune
 
-`mail-prune.py` supports pruning one or many IMAP accounts in a single run.
+`mail-prune.py` now supports pruning one or many IMAP accounts in a single run.
 
 ## Config formats
 
