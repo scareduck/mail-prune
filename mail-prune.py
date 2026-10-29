@@ -891,7 +891,10 @@ def ignore_age_sweep(conn: sqlite3.Connection, imap: imaplib.IMAP4,
 # -----------------------------
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        epilog="For a one-off run with normal retention checks, omit --mailbox to use "
+               "the configured mailbox, or combine --mailbox with --noignore-age."
+    )
     ap.add_argument("--config",
                     default=os.environ.get("MAIL_PRUNE_CONFIG",
                                            "~/.config/mail-prune/config.yaml"),
@@ -907,7 +910,8 @@ def main() -> int:
                            help="Disable ignore-age sweep mode, even when --mailbox is specified.")
     ap.add_argument("--ingest-all", action="store_true",
                     help="Backfill headers for all UIDs into cache (missing-only), then continue normal processing.")
-    ap.add_argument("--mailbox", action="append", default=[])
+    ap.add_argument("--mailbox", action="append", default=[],
+                    help="Override the configured mailbox (repeatable). Also sets --ignore-age. Add --noignore-age to retain age checks.")
     ap.add_argument("--address", help="Only process this configured account.username address.")
     args = ap.parse_args()
 
